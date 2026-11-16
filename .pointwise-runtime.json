@@ -2,6 +2,6 @@
   "version": 1,
   "kind": "cli",
   "setup": [],
-  "verify": ["python3.11", "-B", "-m", "unittest", "discover", "-s", "tests", "-v"],
-  "demo": ["python3.11", "-B", "demo.py", "samples/partition.json"]
+  "verify": ["python3.11", "-B", "run_verify.py"],
+  "demo": ["python3.11", "-B", "run_demo.py"]
 }

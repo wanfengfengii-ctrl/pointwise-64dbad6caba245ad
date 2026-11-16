@@ -2,6 +2,7 @@
 from dataclasses import dataclass
 from fractions import Fraction
 import json
+from types import MappingProxyType
 
 Point = tuple[Fraction, Fraction]
 Ring = tuple[Point, ...]
@@ -124,6 +125,172 @@ class Region:
         return "interior"
 
 
+# --- Conservation transfer -------------------------------------------------
+#
+# Overlap area is measured exactly by vertical slab integration. The plane is
+# split at every ring vertex and every proper edge/edge crossing, so inside a
+# slab the set of crossings of a vertical line with a region's rings is fixed
+# and the covered y-length is linear. Evaluating that length once at the slab
+# midpoint and multiplying by the exact slab width is therefore exact.
+# Holes are odd-even alternations of the same vertical line, so their interiors
+# contribute nothing; point and edge contacts never open a positive interval.
+
+def _region_edges(region):
+    edges = list(_edges(region.outer))
+    for hole in region.holes:
+        edges.extend(_edges(hole))
+    return edges
+
+
+def _edge_crossing_x(a, b, c, d):
+    """x coordinate of a proper (non-collinear) edge/edge crossing, or None."""
+    r = (b[0] - a[0], b[1] - a[1])
+    s = (d[0] - c[0], d[1] - c[1])
+    rxs = r[0] * s[1] - r[1] * s[0]
+    if rxs == 0:
+        return None
+    qp = (c[0] - a[0], c[1] - a[1])
+    t = (qp[0] * s[1] - qp[1] * s[0]) / rxs
+    u = (qp[0] * r[1] - qp[1] * r[0]) / rxs
+    if not (Fraction(0) < t < 1 and Fraction(0) < u < 1):
+        return None
+    return a[0] + t * r[0]
+
+
+def _vertical_intervals(edges, x):
+    """Covered y-intervals of one region on a vertical line through x."""
+    crossings = []
+    for a, b in edges:
+        if (a[0] < x < b[0]) or (b[0] < x < a[0]):
+            y = a[1] + (x - a[0]) * (b[1] - a[1]) / (b[0] - a[0])
+            crossings.append(y)
+    crossings.sort()
+    return [(crossings[i], crossings[i + 1])
+            for i in range(0, len(crossings), 2)]
+
+
+def _interval_overlap_length(first, second):
+    total = Fraction(0)
+    i = j = 0
+    while i < len(first) and j < len(second):
+        lo = max(first[i][0], second[j][0])
+        hi = min(first[i][1], second[j][1])
+        if hi > lo:
+            total += hi - lo
+        if first[i][1] < second[j][1]:
+            i += 1
+        else:
+            j += 1
+    return total
+
+
+def _overlap_area(region_a, region_b):
+    edges_a = _region_edges(region_a)
+    edges_b = _region_edges(region_b)
+    xs = set()
+    for edges in (edges_a, edges_b):
+        for a, b in edges:
+            xs.add(a[0])
+            xs.add(b[0])
+    for a, b in edges_a:
+        for c, d in edges_b:
+            x = _edge_crossing_x(a, b, c, d)
+            if x is not None:
+                xs.add(x)
+    xs = sorted(xs)
+    area = Fraction(0)
+    for left, right in zip(xs, xs[1:]):
+        width = right - left
+        if width == 0:
+            continue
+        middle = (left + right) / 2
+        length = _interval_overlap_length(
+            _vertical_intervals(edges_a, middle),
+            _vertical_intervals(edges_b, middle))
+        area += width * length
+    return area
+
+
+def _disjoint_interiors(region_a, region_b):
+    return _overlap_area(region_a, region_b) == 0
+
+
+def _edge_count(region):
+    return len(region.outer) + sum(len(hole) for hole in region.holes)
+
+
+def _id_list(value):
+    if not isinstance(value, list) or not value:
+        raise ValueError("selection must be a nonempty list of IDs")
+    result = tuple(_identifier(item) for item in value)
+    if len(set(result)) != len(result):
+        raise ValueError("selection contains duplicate IDs")
+    return result
+
+
+class TransferPlan:
+    """Immutable fixed-weight plan; independent of later archive changes."""
+
+    __slots__ = ("_source_ids", "_target_ids", "_source_areas",
+                 "_overlaps", "_uncovered")
+
+    def __init__(self, source_ids, target_ids, source_areas, overlaps,
+                 uncovered):
+        object.__setattr__(self, "_source_ids", tuple(source_ids))
+        object.__setattr__(self, "_target_ids", tuple(target_ids))
+        object.__setattr__(self, "_source_areas",
+                           MappingProxyType(dict(source_areas)))
+        object.__setattr__(self, "_overlaps", MappingProxyType(dict(overlaps)))
+        object.__setattr__(self, "_uncovered",
+                           MappingProxyType(dict(uncovered)))
+
+    @property
+    def source_ids(self):
+        return self._source_ids
+
+    @property
+    def target_ids(self):
+        return self._target_ids
+
+    @property
+    def source_areas(self):
+        return self._source_areas
+
+    @property
+    def overlaps(self):
+        return self._overlaps
+
+    @property
+    def uncovered(self):
+        return self._uncovered
+
+    def __setattr__(self, name, value):
+        raise AttributeError("TransferPlan is immutable")
+
+    def allocate(self, amounts):
+        if not isinstance(amounts, dict):
+            raise ValueError("amounts must be a dict of source ID to Fraction")
+        if set(amounts) != set(self._source_ids):
+            raise ValueError("amounts keys must be exactly the source IDs")
+        for value in amounts.values():
+            if type(value) is not Fraction or value < 0:
+                raise ValueError("each amount must be a nonnegative Fraction")
+        areas = self._source_areas
+        pairs = {}
+        for (source_id, target_id), overlap in self._overlaps.items():
+            pairs[(source_id, target_id)] = (
+                amounts[source_id] * overlap / areas[source_id])
+        remaining = {
+            source_id: (amounts[source_id] * self._uncovered[source_id]
+                        / areas[source_id])
+            for source_id in self._source_ids
+        }
+        totals = {target_id: Fraction(0) for target_id in self._target_ids}
+        for (source_id, target_id), value in pairs.items():
+            totals[target_id] += value
+        return {"pairs": pairs, "remaining": remaining, "totals": totals}
+
+
 def _identifier(value):
     if not isinstance(value, str) or not value:
         raise ValueError("region ID must be a nonempty string")
@@ -191,6 +358,41 @@ class Archive:
 
     def read(self, region_id):
         return self._regions[_identifier(region_id)]
+
+    def transfer_plan(self, source_ids, target_ids):
+        sources = _id_list(source_ids)
+        targets = _id_list(target_ids)
+        source_regions = {region_id: self.read(region_id)
+                          for region_id in sources}
+        target_regions = {region_id: self.read(region_id)
+                          for region_id in targets}
+        edge_budget = (sum(_edge_count(r) for r in source_regions.values())
+                       + sum(_edge_count(r) for r in target_regions.values()))
+        if edge_budget > 120:
+            raise ValueError("selected geometry exceeds the 120-edge limit")
+        for group in (source_regions, target_regions):
+            members = list(group.values())
+            for i in range(len(members)):
+                for j in range(i + 1, len(members)):
+                    if not _disjoint_interiors(members[i], members[j]):
+                        raise ValueError(
+                            "regions in one group must have disjoint interiors")
+        source_areas = {region_id: source_regions[region_id].area
+                        for region_id in sorted(sources)}
+        overlaps = {}
+        covered = {region_id: Fraction(0) for region_id in sources}
+        for source_id in sorted(sources):
+            source_region = source_regions[source_id]
+            for target_id in sorted(targets):
+                overlap = _overlap_area(source_region,
+                                        target_regions[target_id])
+                if overlap > 0:
+                    overlaps[(source_id, target_id)] = overlap
+                    covered[source_id] += overlap
+        uncovered = {region_id: source_areas[region_id] - covered[region_id]
+                     for region_id in sorted(sources)}
+        return TransferPlan(tuple(sorted(sources)), tuple(sorted(targets)),
+                            source_areas, overlaps, uncovered)
 
     def export(self, region_ids=None):
         if region_ids is None:
